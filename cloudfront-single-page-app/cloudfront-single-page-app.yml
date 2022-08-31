@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Parameters:
+  ParamCloudFrontPriceClass:
+    Description: Corresponds with the maximum price that you want to pay for CloudFront service.
+    Type: String
+    AllowedValues: ['PriceClass_100', 'PriceClass_200', 'PriceClass_All']
+    Default: 'PriceClass_100'
+  ParamCloudFrontPasswordProtectionEnabled:
+    Description: Enable a username/password protection for CloudFront Distribution
+    Type: String
+    AllowedValues: ['true', 'false']
+    Default: 'false'
+  ParamCloudFrontUsername:
+    Description: Username used for CloudFront password protection if enabled.
+    Type: String
+    Default: admin
+  ParamCloudFrontPassword:
+    Description: Password used for CloudFront password protection if enabled.
+    Type: String
+    Default: admin
+    NoEcho: true
+  ParamGithubDeploymentRoleEnabled:
+    Description: >
+      Enable creation of a role which can be assumed by Github Action for automated deployment.
+      /!\ You need to create an Identity Provider (not role and policy) first:
+      https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-amazon-web-services
+    Type: String
+    AllowedValues: [ 'true', 'false' ]
+    Default: 'false'
+  ParamGithubDeploymentRepositoryRestriction:
+    Description: >
+      Specify restriction for deployment role usage with thi format:
+      example-organisation/example-repository:ref:refs/heads/example-branch
+      You can use wildcard (for example for refs: 'org/repo:*')
+    Type: String
+    Default: example-organisation/example-repository:ref:refs/heads/example-branch
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'CloudFront configuration'
+        Parameters:
+          - ParamCloudFrontPriceClass
+      - Label:
+          default: 'Password Protection'
+        Parameters:
+          - ParamCloudFrontPasswordProtectionEnabled
+          - ParamCloudFrontUsername
+          - ParamCloudFrontPassword
+      - Label:
+          default: 'Github Deployment Role'
+        Parameters:
+          - ParamGithubDeploymentRoleEnabled
+          - ParamGithubDeploymentRepositoryRestriction
+    ParameterLabels:
+      ParamCloudFrontPriceClass:
+        default: 'CloudFront Price Class:'
+      ParamCloudFrontPasswordProtectionEnabled:
+        default: 'Enable password protection for CloudFront Distribution:'
+      ParamCloudFrontUsername:
+        default: 'Username for CloudFront Distribution (if protection enabled):'
+      ParamCloudFrontPassword:
+        default: 'Password for CloudFront Distribution (if protection enabled):'
+      ParamGithubDeploymentRoleEnabled:
+        default: 'Enable Github Role creation:'
+      ParamGithubDeploymentRepositoryRestriction:
+        default: 'Github Role usage restriction:'
+
+Conditions:
+  CondCloudFrontPasswordProtectionEnabled: !Equals ['true', !Ref ParamCloudFrontPasswordProtectionEnabled]
+  CondGithubDeploymentRoleEnabled: !Equals ['true', !Ref ParamGithubDeploymentRoleEnabled]
+
+Resources:
+  WebsiteBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Join ['-', [!Ref AWS::StackName, 'website', !Select [0, !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId ]]]]]]
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - GET
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            ExposedHeaders:
+              - ETag
+              - Content-Length
+              - x-amz-meta-uuid
+              - x-amz-meta-md5
+            MaxAge: 3000
+
+  BucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Id: WebsiteBucketPolicy
+        Version: 2012-10-17
+        Statement:
+          - Effect: Deny
+            Action: '*'
+            Principal: '*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+          - Effect: Allow
+            Action: 's3:GetObject'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${OriginAccessIdentity}'
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+
+  Distribution:
+    Type: 'AWS::CloudFront::Distribution'
+    Properties:
+      DistributionConfig:
+        Enabled: 'true'
+        Comment: !Ref AWS::StackName
+        Origins:
+          - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            Id: !Sub 'S3-${WebsiteBucket}'
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${OriginAccessIdentity}'
+        DefaultRootObject: index.html
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - OPTIONS
+            - GET
+            - HEAD
+          CachedMethods:
+            - OPTIONS
+            - GET
+            - HEAD
+          TargetOriginId: !Sub 'S3-${WebsiteBucket}'
+          ForwardedValues:
+            QueryString: 'false'
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+          FunctionAssociations: !If
+            - CondCloudFrontPasswordProtectionEnabled
+            - - EventType: viewer-request
+                FunctionARN: !GetAtt PasswordProtectionFunction.FunctionMetadata.FunctionARN
+            - !Ref AWS::NoValue
+        PriceClass: !Ref ParamCloudFrontPriceClass
+
+  OriginAccessIdentity:
+    Type: 'AWS::CloudFront::CloudFrontOriginAccessIdentity'
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Ref AWS::StackName
+
+  PasswordProtectionFunction:
+    Type: 'AWS::CloudFront::Function'
+    Condition: CondCloudFrontPasswordProtectionEnabled
+    Properties:
+      AutoPublish: true
+      Name: !Sub '${AWS::StackName}-password-protection'
+      FunctionConfig:
+        Comment: !Sub '${AWS::StackName} password protection function'
+        Runtime: cloudfront-js-1.0
+      FunctionCode: !Sub
+        - >
+          function handler(event) {
+            var auth = event.request.headers.authorization;
+            if (auth && auth.value === 'Basic ${EncodedAuth}') {
+              return event.request;
+            }
+            return {
+              statusCode: 401,
+              statusDescription: 'Unauthorized',
+              headers: {'www-authenticate': {value: 'Basic'}}
+            };
+          }
+        - EncodedAuth:
+            Fn::Base64:
+              !Sub '${ParamCloudFrontUsername}:${ParamCloudFrontPassword}'
+
+  GithubDeploymentRole:
+    Type: 'AWS::IAM::Role'
+    Condition: CondGithubDeploymentRoleEnabled
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-github-deployment'
+      Description: Role used for automated deployment from Github Action.
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub 'arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com'
+            Action: 'sts:AssumeRoleWithWebIdentity'
+            Condition:
+              StringEquals:
+                'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com'
+              StringLike:
+                'token.actions.githubusercontent.com:sub': !Sub 'repo:${ParamGithubDeploymentRepositoryRestriction}'
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-github-deployment'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 'cloudfront:CreateInvalidation'
+                Resource:
+                  - !GetAtt WebsiteBucket.Arn
+                  - !Sub '${WebsiteBucket.Arn}/*'
+                  - !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
